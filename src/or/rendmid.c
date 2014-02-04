@@ -15,6 +15,9 @@
 #include "rendmid.h"
 #include "rephist.h"
 
+/* for mapping between nego id to circuits */
+static digestmap_t *nego_circ_map = NULL;
+
 /** Respond to an ESTABLISH_INTRO cell by checking the signed data and
  * setting the circuit's purpose and service pk digest.
  */
@@ -211,6 +214,172 @@ rend_mid_introduce(or_circuit_t *circ, const uint8_t *request,
   return -1;
 }
 
+int
+rend_mid_introduce_hash_ra(or_circuit_t *circ, const uint8_t *request,
+                            size_t request_len)
+{
+  or_circuit_t *intro_circ;
+  char serviceid[REND_SERVICE_ID_LEN_BASE32+1];
+  char nak_body[1];
+
+  log_info(LD_REND, "Received an INTRODUCE_HASH_RA1 request on circuit %u",
+           (unsigned)circ->p_circ_id);
+
+  if (circ->base_.purpose != CIRCUIT_PURPOSE_OR || circ->base_.n_chan) {
+    log_warn(LD_PROTOCOL,
+             "Rejecting INTRODUCE_HASH_RA1 on non-OR or non-edge circuit %u.",
+             (unsigned)circ->p_circ_id);
+    goto err;
+  }
+
+  /* We could change this to MAX_HEX_NICKNAME_LEN now that 0.0.9.x is
+   * obsolete; however, there isn't much reason to do so, and we're going
+   * to revise this protocol anyway.
+   */
+  if (request_len < (DIGEST_LEN+(MAX_NICKNAME_LEN+1)+REND_COOKIE_LEN)) {
+    log_warn(LD_PROTOCOL, "Impossibly short INTRODUCE_HASH_RA1 cell on circuit %u; "
+             "responding with nack.",
+             (unsigned)circ->p_circ_id);
+    goto err;
+  }
+
+  base32_encode(serviceid, REND_SERVICE_ID_LEN_BASE32+1,
+                (char*)request, REND_SERVICE_ID_LEN);
+
+  /* The first 20 bytes are all we look at: they have a hash of Bob's PK. */
+  intro_circ = circuit_get_intro_point((char*)request);
+  if (!intro_circ) {
+    log_info(LD_REND,
+             "No intro circ found for INTRODUCE_HASH_RA1 cell (%s) from circuit %u; "
+             "responding with nack.",
+             safe_str(serviceid), (unsigned)circ->p_circ_id);
+    goto err;
+  }
+
+  log_info(LD_REND,
+           "Sending introduction request for service %s "
+           "from circ %u to circ %u",
+           safe_str(serviceid), (unsigned)circ->p_circ_id,
+           (unsigned)intro_circ->p_circ_id);
+
+  /* Great.  Now we just relay the cell down the circuit. */
+  if (relay_send_command_from_edge(0, TO_CIRCUIT(intro_circ),
+                                   RELAY_COMMAND_INTRODUCE_HASH_RA2,
+                                   (char*)request, request_len, NULL)) {
+    log_warn(LD_GENERAL,
+             "Unable to send INTRODUCE_HASH_RA2 cell to Tor client.");
+    goto err;
+  }
+
+  /* mark client side circuit with nego cookie */
+  memset(circ->rend_token, 0, REND_NEGO_ID_LEN);
+  memcpy(circ->rend_token, request+DIGEST_LEN, REND_NEGO_ID_LEN);
+  if (!nego_circ_map)
+    nego_circ_map = digestmap_new();
+  /*@TODO free hashmap entry after merged with bug9841  18.03 2014 (houqp)*/
+  digestmap_set(nego_circ_map, circ->rend_token, circ);
+
+  return 0;
+ err:
+  /* Send the client an NACK */
+  nak_body[0] = 1;
+  if (relay_send_command_from_edge(0,TO_CIRCUIT(circ),
+                                   RELAY_COMMAND_INTRODUCE_ACK,
+                                   nak_body, 1, NULL)) {
+    log_warn(LD_GENERAL, "Unable to send NAK to Tor client.");
+    /* Is this right? */
+    circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
+  }
+  return -1;
+}
+
+int
+rend_mid_introduce_rb(or_circuit_t *circ, const uint8_t *request,
+                            size_t request_len)
+{
+  or_circuit_t *intro_circ;
+  char nak_body[1];
+
+  log_info(LD_REND, "Received INTRODUCE_RB1 cell for on circ %u.",
+      (unsigned) circ->base_.n_circ_id);
+
+  if (!nego_circ_map)
+    goto invalid_nego_id;
+
+  intro_circ = digestmap_get(nego_circ_map, (char*)request);
+  if (!intro_circ)
+    goto invalid_nego_id;
+
+  log_info(LD_REND,
+      "Sending INTRODUCE_RB2 cell.... intro_circ: %p, req:%p, len:%zu",
+      intro_circ, request, request_len);
+  /* Great.  Now we just relay the cell down the circuit. */
+  if (relay_send_command_from_edge(0, TO_CIRCUIT(intro_circ),
+                                   RELAY_COMMAND_INTRODUCE_RB2,
+                                   (char*)request, request_len, NULL)) {
+    log_warn(LD_GENERAL,
+             "Unable to send INTRODUCE_RB2 cell to Tor client.");
+    goto err;
+  }
+
+  return 0;
+
+ invalid_nego_id:
+    log_info(LD_REND, "Invalid nego id found!");
+ err:
+  /* Send the client an NACK */
+  nak_body[0] = 1;
+  if (relay_send_command_from_edge(0,TO_CIRCUIT(circ),
+                                   RELAY_COMMAND_INTRODUCE_ACK,
+                                   nak_body, 1, NULL)) {
+    log_warn(LD_GENERAL, "Unable to send NAK to Tor client.");
+    /* Is this right? */
+    circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
+  }
+  return -1;
+}
+
+int
+rend_mid_introduce_ra(or_circuit_t *circ, const uint8_t *request,
+                            size_t request_len)
+{
+  or_circuit_t *intro_circ;
+  char nak_body[1];
+
+  log_info(LD_REND, "Received INTRODUCE_RA1 cell from client on circ %u.",
+      (unsigned) circ->base_.n_circ_id);
+
+
+  intro_circ = circuit_get_intro_point((char*)request);
+
+  log_info(LD_REND,
+      "Sending INTRODUCE_RA2 cell.... intro_circ: %p, req:%p, len:%zu, ra: %lu",
+      intro_circ, request, request_len, get_uint64(request+DIGEST_LEN));
+  /* Great.  Now we just relay the cell down the circuit. */
+  if (relay_send_command_from_edge(0, TO_CIRCUIT(intro_circ),
+                                   RELAY_COMMAND_INTRODUCE_RA2,
+                                   (char *)request,
+                                   request_len, NULL)) {
+    log_warn(LD_GENERAL,
+             "Unable to send INTRODUCE_RA2 cell to Hidden Service.");
+    goto err;
+  }
+
+  return 0;
+
+ err:
+  /* Send the client an NACK */
+  nak_body[0] = 1;
+  if (relay_send_command_from_edge(0, TO_CIRCUIT(circ),
+                                   RELAY_COMMAND_INTRODUCE_ACK,
+                                   nak_body, 1, NULL)) {
+    log_warn(LD_GENERAL, "Unable to send NAK to Tor client.");
+    /* Is this right? */
+    circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
+  }
+  return -1;
+}
+
 /** Process an ESTABLISH_RENDEZVOUS cell by setting the circuit's purpose and
  * rendezvous cookie.
  */
@@ -339,3 +508,94 @@ rend_mid_rendezvous(or_circuit_t *circ, const uint8_t *request,
   return -1;
 }
 
+
+int
+rend_mid_5hop_rendezvous(or_circuit_t *circ, const uint8_t *request,
+                    size_t request_len)
+{
+  int reason = END_CIRC_REASON_INTERNAL;
+  int is_client;
+  or_circuit_t *first_circ, *client_circ, *serv_circ;
+  char *payload;
+  size_t payload_len;
+  char hexid[9];
+  (void) request_len;
+
+  base16_encode(hexid, sizeof(hexid), (const char*)request, 4);
+  is_client = request_len <= REND_COOKIE_LEN;
+
+  log_info(LD_REND, "Got 5hop establish rendezvous cell! cookie [%s], from %s",
+            hexid, is_client ? "client" : "server");
+
+  /* check whether the other party is already connected */
+  first_circ = circuit_get_rendezvous((char*)request);
+
+  if (!first_circ) {
+    /* we are the first */
+    circuit_change_purpose(TO_CIRCUIT(circ), CIRCUIT_PURPOSE_REND_POINT_WAITING);
+    memcpy(circ->rend_token, request, REND_COOKIE_LEN);
+    log_info(LD_REND, "Established rendezvous point on circuit %u for cookie: %s",
+        circ->p_circ_id, hexid);
+    if (!is_client) {
+      /* save request data for later uses */
+      circ->rend_request_len = request_len-REND_COOKIE_LEN;
+      circ->rend_request = tor_malloc(circ->rend_request_len);
+      memcpy(circ->rend_request,
+             request+REND_COOKIE_LEN,
+             circ->rend_request_len);
+      log_info(LD_REND, "client is not connected yet.");
+    } else {
+      log_info(LD_REND, "server is not connected yet.");
+    }
+  } else {
+    /* the other party is already connected, join two circuits */
+    if (is_client) {
+      /* server reached first */
+      client_circ = circ;
+      serv_circ = first_circ;
+      payload = first_circ->rend_request;
+      payload_len = first_circ->rend_request_len;
+    } else {
+      /* client reached first */
+      client_circ = first_circ;
+      serv_circ = circ;
+      payload = (char *)(request + REND_COOKIE_LEN);
+      payload_len = request_len - REND_COOKIE_LEN;
+    }
+
+    log_info(LD_REND, "Sending RENDEZVOUS2 cell to client...");
+    if (relay_send_command_from_edge(0, TO_CIRCUIT(client_circ),
+                                     RELAY_COMMAND_RENDEZVOUS2,
+                                     payload,
+                                     payload_len, NULL)) {
+      log_warn(LD_GENERAL,
+               "Unable to send RENDEZVOUS2 cell to client on circuit %u.",
+               (unsigned)first_circ->p_circ_id);
+      goto err;
+    }
+    if (serv_circ->rend_request)
+      tor_free(serv_circ->rend_request);
+
+    /* join the circuits */
+    log_info(LD_REND,
+             "Completing rendezvous: circuit %u joins circuit %u (cookie %s)",
+             (unsigned)circ->p_circ_id, (unsigned)first_circ->p_circ_id, hexid);
+    circuit_change_purpose(TO_CIRCUIT(circ),
+                           CIRCUIT_PURPOSE_REND_ESTABLISHED);
+    circuit_change_purpose(TO_CIRCUIT(first_circ),
+                           CIRCUIT_PURPOSE_REND_ESTABLISHED);
+    memset(circ->rend_token, 0, REND_COOKIE_LEN);
+    memset(first_circ->rend_token, 0, REND_COOKIE_LEN);
+
+    first_circ->rend_splice = circ;
+    circ->rend_splice = first_circ;
+  }
+
+  return 0;
+
+ err:
+  circuit_mark_for_close(TO_CIRCUIT(circ), reason);
+  if (first_circ)
+    circuit_mark_for_close(TO_CIRCUIT(first_circ), reason);
+  return -1;
+}

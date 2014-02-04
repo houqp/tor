@@ -140,6 +140,7 @@ rend_client_should_send_timestamp(void)
   return networkstatus_get_param(NULL, "Support022HiddenServices", 1, 0, 1);
 }
 
+
 /** Called when we're trying to connect an ap conn; sends an INTRODUCE1 cell
  * down introcirc if possible.
  */
@@ -157,6 +158,7 @@ rend_client_send_introduction(origin_circuit_t *introcirc,
   crypto_pk_t *intro_key = NULL;
   int status = 0;
 
+  tor_assert(rendcirc);
   tor_assert(introcirc->base_.purpose == CIRCUIT_PURPOSE_C_INTRODUCING);
   tor_assert(rendcirc->base_.purpose == CIRCUIT_PURPOSE_C_REND_READY);
   tor_assert(introcirc->rend_data);
@@ -354,6 +356,162 @@ rend_client_send_introduction(origin_circuit_t *introcirc,
   return status;
 }
 
+static inline crypto_pk_t *
+find_intro_key_from_entry(rend_cache_entry_t *entry,
+                          origin_circuit_t *introcirc)
+{
+  SMARTLIST_FOREACH(entry->parsed->intro_nodes, rend_intro_point_t *,
+                    intro, {
+    if (tor_memeq(introcirc->build_state->chosen_exit->identity_digest,
+                intro->extend_info->identity_digest, DIGEST_LEN)) {
+      return intro->intro_key;
+    }
+  });
+
+  return NULL;
+}
+
+int
+rend_client_send_5hop_introduction(origin_circuit_t *introcirc,
+                              origin_circuit_t *rendcirc)
+{
+  size_t payload_len;
+  int r, v4_shift = 0;
+  char payload[RELAY_PAYLOAD_SIZE];
+  char tmp[RELAY_PAYLOAD_SIZE];
+  rend_cache_entry_t *entry;
+  /*off_t dh_offset;*/
+  crypto_pk_t *intro_key = NULL;
+  int status = 0;
+  nego_state_t *nego_state;
+  (void) rendcirc;
+
+  tor_assert(introcirc->base_.purpose == CIRCUIT_PURPOSE_C_INTRODUCING);
+  tor_assert(introcirc->rend_data);
+#ifndef NON_ANONYMOUS_MODE_ENABLED
+  tor_assert(!(introcirc->build_state->onehop_tunnel));
+#endif
+
+  if (rend_cache_lookup_entry(introcirc->rend_data->onion_address, -1,
+                              &entry) < 1) {
+    log_info(LD_REND,
+             "query %s didn't have valid rend desc in cache. "
+             "Refetching descriptor.",
+             safe_str_client(introcirc->rend_data->onion_address));
+    rend_client_refetch_v2_renddesc(introcirc->rend_data);
+    {
+      connection_t *conn;
+
+      while ((conn = connection_get_by_type_state_rendquery(CONN_TYPE_AP,
+                       AP_CONN_STATE_CIRCUIT_WAIT,
+                       introcirc->rend_data->onion_address))) {
+        conn->state = AP_CONN_STATE_RENDDESC_WAIT;
+      }
+    }
+
+    status = -1;
+    goto cleanup;
+  }
+
+  /* first 20 bytes of payload are the hash of Bob's pk */
+  intro_key = find_intro_key_from_entry(entry, introcirc);
+  if (!intro_key) {
+    log_info(LD_REND, "Could not find intro key for %s at %s; we "
+             "have a v2 rend desc with %d intro points. "
+             "Trying a different intro point...",
+             safe_str_client(introcirc->rend_data->onion_address),
+             safe_str_client(extend_info_describe(
+                                   introcirc->build_state->chosen_exit)),
+             smartlist_len(entry->parsed->intro_nodes));
+
+    if (rend_client_reextend_intro_circuit(introcirc)) {
+      status = -2;
+      goto perm_err;
+    } else {
+      status = -1;
+      goto cleanup;
+    }
+  }
+  if (crypto_pk_get_digest(intro_key, payload)<0) {
+    log_warn(LD_BUG, "Internal error: couldn't hash public key.");
+    status = -2;
+    goto perm_err;
+  }
+
+  /* now setup nego state */
+  nego_state = &introcirc->rend_data->nego_state;
+  nego_state->is_client = 1;
+  memcpy(introcirc->rend_data->rend_pk_digest, payload, DIGEST_LEN);
+
+  /* setup nego_identifier */
+  crypto_rand(nego_state->nego_id, REND_NEGO_ID_LEN);
+  memcpy(payload+DIGEST_LEN, nego_state->nego_id, REND_NEGO_ID_LEN);
+
+  /* set up encrypted part of the payload */
+  tmp[0] = 4; /* version 4 of the cell format */
+  tmp[1] = (uint8_t)introcirc->rend_data->auth_type; /* auth type, if any */
+  v4_shift = 2;
+
+  /* generate RA and HASH_RA */
+  /*nego_state->ra = 1234;*/
+  crypto_rand((char *)&nego_state->ra, sizeof(nego_state->ra));
+  crypto_digest(tmp+v4_shift,
+                (char *)&nego_state->ra,
+                sizeof(nego_state->ra));
+  v4_shift += DIGEST_LEN;
+
+  note_crypto_pk_op(REND_CLIENT);
+  /*XXX maybe give crypto_pk_public_hybrid_encrypt a max_len arg,
+   * to avoid buffer overflows? */
+  r = crypto_pk_public_hybrid_encrypt(intro_key,
+                                      payload+DIGEST_LEN+REND_NEGO_ID_LEN,
+                                      sizeof(payload)-(DIGEST_LEN+REND_NEGO_ID_LEN),
+                                      tmp,
+                                      (int)v4_shift,
+                                      PK_PKCS1_OAEP_PADDING, 0);
+  if (r<0) {
+    log_warn(LD_BUG,"Internal error: hybrid pk encrypt failed.");
+    status = -2;
+    goto perm_err;
+  }
+
+  payload_len = DIGEST_LEN + REND_NEGO_ID_LEN + r;
+  tor_assert(payload_len <= RELAY_PAYLOAD_SIZE); /* we overran something */
+
+  log_info(LD_REND, "++++ Sending an INTRODUCE_HASH_RA1 cell, len: %zu, %x",
+      payload_len, *(int *)tmp);
+  if (relay_send_command_from_edge(0, TO_CIRCUIT(introcirc),
+                                   RELAY_COMMAND_INTRODUCE_HASH_RA1,
+                                   payload, payload_len,
+                                   introcirc->cpath->prev)<0) {
+    /* introcirc is already marked for close. leave rendcirc alone. */
+    log_warn(LD_BUG, "Couldn't send INTRODUCE_HASH_RA1 cell");
+    status = -2;
+    goto cleanup;
+  }
+
+  /* Now, we wait for an ACK or NAK on this circuit. */
+  circuit_change_purpose(TO_CIRCUIT(introcirc),
+                         CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT);
+  /* Set timestamp_dirty, because circuit_expire_building expects it
+   * to specify when a circuit entered the _C_INTRODUCE_ACK_WAIT
+   * state. */
+  introcirc->base_.timestamp_dirty = time(NULL);
+
+  pathbias_count_use_attempt(introcirc);
+
+  goto cleanup;
+
+ perm_err:
+  if (!introcirc->base_.marked_for_close)
+    circuit_mark_for_close(TO_CIRCUIT(introcirc), END_CIRC_REASON_INTERNAL);
+ cleanup:
+  memwipe(payload, 0, sizeof(payload));
+  memwipe(tmp, 0, sizeof(tmp));
+
+  return status;
+}
+
 /** Called when a rendezvous circuit is open; sends a establish
  * rendezvous circuit as appropriate. */
 void
@@ -393,6 +551,229 @@ rend_client_close_other_intros(const char *onion_address)
       }
     }
   }
+}
+
+int
+rend_client_introduce_rb(origin_circuit_t *introcirc, const uint8_t *request,
+                            size_t request_len)
+{
+  size_t payload_len;
+  char payload[RELAY_PAYLOAD_SIZE];
+  char tmp[RELAY_PAYLOAD_SIZE];
+  int status = 0, v4_shift = 0, r;
+  rend_data_t *rend_data;
+  nego_state_t *nego_state;
+  extend_info_t *rp_info;
+  origin_circuit_t *rp_circ = NULL;
+  char serviceid[REND_SERVICE_ID_LEN_BASE32+1];
+  char hexcookie[9];
+  crypt_path_t *cpath = NULL;
+  crypto_pk_t *intro_key = NULL;
+  rend_cache_entry_t *entry;
+  const node_t *rp;
+  (void) request_len;
+
+  log_info(LD_REND, "Received INTRODUCE_RB2 cell for intro introcirc %u.",
+      (unsigned) introcirc->base_.n_circ_id);
+
+  /* For path bias: This circuit was used successfully. Valid
+   * nacks and acks count. */
+  pathbias_mark_use_success(introcirc);
+
+  if (rend_cache_lookup_entry(introcirc->rend_data->onion_address, -1,
+                              &entry) < 1) {
+    log_info(LD_REND,
+             "query %s didn't have valid rend desc in cache. "
+             "Refetching descriptor.",
+             safe_str_client(introcirc->rend_data->onion_address));
+    rend_client_refetch_v2_renddesc(introcirc->rend_data);
+    {
+      connection_t *conn;
+
+      while ((conn = connection_get_by_type_state_rendquery(CONN_TYPE_AP,
+                       AP_CONN_STATE_CIRCUIT_WAIT,
+                       introcirc->rend_data->onion_address))) {
+        conn->state = AP_CONN_STATE_RENDDESC_WAIT;
+      }
+    }
+
+    status = -1;
+    goto cleanup;
+  }
+
+  /* first 20 bytes of payload are the hash of Bob's pk */
+  intro_key = find_intro_key_from_entry(entry, introcirc);
+  if (!intro_key) {
+    log_info(LD_REND, "Could not find intro key for %s at %s; we "
+             "have a v2 rend desc with %d intro points. "
+             "Trying a different intro point...",
+             safe_str_client(introcirc->rend_data->onion_address),
+             safe_str_client(extend_info_describe(
+                                   introcirc->build_state->chosen_exit)),
+             smartlist_len(entry->parsed->intro_nodes));
+
+    if (rend_client_reextend_intro_circuit(introcirc)) {
+      status = -2;
+      goto perm_err;
+    } else {
+      status = -1;
+      goto cleanup;
+    }
+  }
+
+  rend_data = introcirc->rend_data;
+  nego_state = &rend_data->nego_state;
+  /* validate nego id */
+  if (tor_memneq(nego_state->nego_id, request, REND_NEGO_ID_LEN)) {
+    log_warn(LD_REND, "Got unmatched nego ID from intro circuit!");
+    goto err;
+  }
+  nego_state->rb = get_uint64(request+REND_NEGO_ID_LEN);
+
+  log_info(LD_REND, "get rb from HS: %lu", nego_state->rb);
+
+  /* generate rendcookie now */
+  if (crypto_rand(rend_data->rend_cookie, REND_COOKIE_LEN) < 0) {
+    log_warn(LD_BUG, "Internal error: Couldn't produce random cookie.");
+    circuit_mark_for_close(TO_CIRCUIT(introcirc), END_CIRC_REASON_INTERNAL);
+    return -1;
+  }
+  base16_encode(hexcookie, 9, (const char *)(rend_data->rend_cookie), 4);
+
+  /* generate DH keys, cpath is supposed to be freed in circuit_clear_cpath */
+  cpath = tor_malloc_zero(sizeof(crypt_path_t));
+  cpath->magic = CRYPT_PATH_MAGIC;
+  if (!(cpath->rend_dh_handshake_state = crypto_dh_new(DH_TYPE_REND))) {
+    log_warn(LD_BUG, "Internal error: couldn't allocate DH.");
+    status = -2;
+    goto perm_err;
+  }
+  if (crypto_dh_generate_public(cpath->rend_dh_handshake_state)<0) {
+    log_warn(LD_BUG, "Internal error: couldn't generate g^x.");
+    status = -2;
+    goto perm_err;
+  }
+
+  /* build cell */
+  memwipe(payload, 0, sizeof(payload));
+  /* rend pk for intro point */
+  payload_len = 0;
+  memcpy(payload, rend_data->rend_pk_digest, DIGEST_LEN);
+  payload_len += DIGEST_LEN;
+
+  /* set nego id */
+  memcpy(payload+payload_len, nego_state->nego_id, REND_NEGO_ID_LEN);
+  payload_len += REND_NEGO_ID_LEN;
+
+  /* build encrypted part of payload */
+  /* set ra */
+  set_uint64(tmp, nego_state->ra);
+  v4_shift = sizeof(nego_state->ra);
+  /* set rend cookie */
+  memcpy(tmp+v4_shift, rend_data->rend_cookie, REND_COOKIE_LEN);
+  v4_shift += REND_COOKIE_LEN;
+  /* set dh key */
+  if (crypto_dh_get_public(cpath->rend_dh_handshake_state,
+                           tmp+v4_shift,
+                           DH_KEY_LEN)<0) {
+    log_warn(LD_BUG, "Internal error: couldn't extract g^x.");
+    status = -2;
+    goto perm_err;
+  }
+  v4_shift += DH_KEY_LEN;
+
+  note_crypto_pk_op(REND_CLIENT);
+  /*XXX maybe give crypto_pk_public_hybrid_encrypt a max_len arg,
+   * to avoid buffer overflows? */
+  r = crypto_pk_public_hybrid_encrypt(intro_key,
+                                      payload+DIGEST_LEN+REND_NEGO_ID_LEN,
+                                      sizeof(payload)-(DIGEST_LEN+REND_NEGO_ID_LEN),
+                                      tmp,
+                                      (int)v4_shift,
+                                      PK_PKCS1_OAEP_PADDING, 0);
+  if (r < 0) {
+    log_warn(LD_BUG,"Internal error: hybrid pk encrypt failed.");
+    status = -2;
+    goto perm_err;
+  }
+  payload_len = DIGEST_LEN + REND_NEGO_ID_LEN + r;
+
+  log_info(LD_REND, "Sending an INTRODUCE_RA1 cell, ra: %lu, cookie: %s",
+            nego_state->ra, hexcookie);
+  if (relay_send_command_from_edge(0, TO_CIRCUIT(introcirc),
+                                   RELAY_COMMAND_INTRODUCE_RA1,
+                                   payload, payload_len,
+                                   introcirc->cpath->prev)<0) {
+    /* mark introcirc for close. */
+    log_warn(LD_BUG, "Couldn't send INTRODUCE_RA1 cell");
+    status = -2;
+    goto err;
+  }
+
+  /* mark ack received, we don't close intro circuit right away
+   * instead, we still keep it around for future renegotiation */
+  circuit_change_purpose(TO_CIRCUIT(introcirc),
+                         CIRCUIT_PURPOSE_C_INTRODUCE_ACKED);
+  /* since we already has one opened close any other intros launched in
+   * parallel */
+  rend_client_close_other_intros(introcirc->rend_data->onion_address);
+
+  rp = rend_get_rp_from_ra_rb(nego_state);
+  log_info(LD_REND, "ra: %lu, rb: %lu, Calculated RP: %s",
+      nego_state->ra,
+      nego_state->rb,
+      node_describe(rp));
+
+  rp_info = extend_info_from_node(rp, 0);
+  rp_circ = circuit_launch_by_extend_info(
+                CIRCUIT_PURPOSE_5H_CONNECT_REND,
+                rp_info,
+                CIRCLAUNCH_NEED_CAPACITY | CIRCLAUNCH_IS_INTERNAL);
+
+  if (!rp_circ) {
+    base32_encode(serviceid, REND_SERVICE_ID_LEN_BASE32+1,
+                  rend_data->onion_address, REND_SERVICE_ID_LEN);
+    log_warn(LD_REND, "Giving up launching first hop of circuit to rendezvous "
+             "point %s for service %s.",
+             safe_str_client(extend_info_describe(rp_info)),
+             serviceid);
+    status = -1;
+    /*@TODO copy from rendservice  20.02 2014 (houqp)*/
+
+    /*@TODO notify server via introduction circuit that we cannot establish to
+     * RP  20.02 2014 (houqp)*/
+  }
+
+  tor_assert(rp_circ->build_state);
+  /* Fill in the circuit's state. */
+  rp_circ->rend_data = tor_malloc_zero(sizeof(rend_data_t));
+  memcpy(rp_circ->rend_data->rend_cookie,
+         rend_data->rend_cookie,
+         REND_COOKIE_LEN);
+  memcpy(rp_circ->rend_data->rend_pk_digest,
+         rend_data->rend_pk_digest,
+         DIGEST_LEN);
+  strlcpy(rp_circ->rend_data->onion_address,
+          rend_data->onion_address,
+          sizeof(rp_circ->rend_data->onion_address));
+  /* copy intro state information */
+  memcpy(&rp_circ->rend_data->nego_state, nego_state, sizeof(nego_state_t));
+  /* set DH state */
+  rp_circ->build_state->pending_final_cpath = cpath;
+
+  goto cleanup;
+
+ perm_err:
+ err:
+  /* put link cpath with introcirc so it can be free in circuit_free */
+  introcirc->cpath = cpath;
+  if (!introcirc->base_.marked_for_close)
+    circuit_mark_for_close(TO_CIRCUIT(introcirc), END_CIRC_REASON_INTERNAL);
+
+ cleanup:
+  memwipe(payload, 0, sizeof(payload));
+
+  return status;
 }
 
 /** Called when get an ACK or a NAK for a REND_INTRODUCE1 cell.
@@ -969,7 +1350,8 @@ rend_client_receive_rendezvous(origin_circuit_t *circ, const uint8_t *request,
   char keys[DIGEST_LEN+CPATH_KEY_MATERIAL_LEN];
 
   if ((circ->base_.purpose != CIRCUIT_PURPOSE_C_REND_READY &&
-       circ->base_.purpose != CIRCUIT_PURPOSE_C_REND_READY_INTRO_ACKED)
+       circ->base_.purpose != CIRCUIT_PURPOSE_C_REND_READY_INTRO_ACKED &&
+       TO_CIRCUIT(circ)->purpose != CIRCUIT_PURPOSE_5H_CONNECT_REND)
       || !circ->build_state->pending_final_cpath) {
     log_warn(LD_PROTOCOL,"Got rendezvous2 cell from hidden service, but not "
              "expecting it. Closing.");
@@ -1010,6 +1392,7 @@ rend_client_receive_rendezvous(origin_circuit_t *circ, const uint8_t *request,
   crypto_dh_free(hop->rend_dh_handshake_state);
   hop->rend_dh_handshake_state = NULL;
 
+  log_info(LD_REND, "mark rend circuit as joined...");
   /* All is well. Extend the circuit. */
   circuit_change_purpose(TO_CIRCUIT(circ), CIRCUIT_PURPOSE_C_REND_JOINED);
   hop->state = CPATH_STATE_OPEN;
@@ -1027,6 +1410,7 @@ rend_client_receive_rendezvous(origin_circuit_t *circ, const uint8_t *request,
   onion_append_to_cpath(&circ->cpath, hop);
   circ->build_state->pending_final_cpath = NULL; /* prevent double-free */
 
+  log_info(LD_REND, "try attaching stream for rend circuit");
   circuit_try_attaching_streams(circ);
 
   memwipe(keys, 0, sizeof(keys));

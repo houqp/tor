@@ -53,5 +53,12 @@ rend_service_authorization_t *rend_client_lookup_service_authorization(
 void rend_service_authorization_free_all(void);
 rend_data_t *rend_data_dup(const rend_data_t *request);
 
+
+int rend_client_send_5hop_introduction(origin_circuit_t *introcirc,
+                              origin_circuit_t *rendcirc);
+
+int
+rend_client_introduce_rb(origin_circuit_t *circ, const uint8_t *request,
+                            size_t request_len);
 #endif
 

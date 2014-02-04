@@ -13,6 +13,7 @@
 #define TOR_RENDSERVICE_H
 
 #include "or.h"
+#include "rendcommon.h"
 
 typedef struct rend_intro_cell_s rend_intro_cell_t;
 
@@ -59,6 +60,9 @@ struct rend_intro_cell_s {
       /* Rendezvous point's IP address/port, identity digest and onion key */
       extend_info_t *extend_info;
     } v3;
+    struct {
+      nego_state_t state;
+    } v4;
   } u;
   /* Rendezvous cookie */
   uint8_t rc[REND_COOKIE_LEN];
@@ -103,5 +107,12 @@ int rend_service_set_connection_addr_port(edge_connection_t *conn,
 void rend_service_dump_stats(int severity);
 void rend_service_free_all(void);
 
+int
+rend_service_introduce_hash_ra(origin_circuit_t *circuit, const uint8_t *request,
+                       size_t request_len);
+
+int
+rend_service_introduce_ra(origin_circuit_t *circuit, const uint8_t *request,
+                       size_t request_len);
 #endif
 

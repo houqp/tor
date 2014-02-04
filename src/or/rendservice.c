@@ -61,6 +61,9 @@ static ssize_t rend_service_parse_intro_for_v3(
     size_t plaintext_len,
     char **err_msg_out);
 
+/* for mapping between nego id to nego state */
+static digestmap_t *nego_state_map = NULL;
+
 /** Represents the mapping from a virtual port of a rendezvous service to
  * a real port on some IP.
  */
@@ -1083,6 +1086,587 @@ rend_service_note_removing_intro_point(rend_service_t *service,
  * Handle cells
  ******/
 
+static rend_intro_cell_t *
+rend_service_begin_parse_intro_cell(const uint8_t *request,
+                               size_t request_len,
+                               uint8_t type,
+                               char **err_msg_out)
+{
+  rend_intro_cell_t *rv = NULL;
+  char *err_msg = NULL;
+
+  if (!request || request_len <= 0) goto err;
+  if (!(type == 1 || type == 2)) goto err;
+
+  /* First, check that the cell is long enough to be a sensible INTRODUCE */
+
+  /* min key length plus digest length plus nickname length */
+  if (request_len < (DIGEST_LEN + REND_NEGO_ID_LEN)) {
+    if (err_msg_out)
+      tor_asprintf(&err_msg, "got a truncated INTRODUCE HASH_RA cell");
+    goto err;
+  }
+
+  /* Allocate a new parsed cell structure */
+  rv = tor_malloc_zero(sizeof(*rv));
+
+  /* Set the type */
+  rv->type = type;
+
+  /* Copy in the ID */
+  memcpy(rv->pk, request, DIGEST_LEN);
+  memcpy(rv->u.v4.state.nego_id, request+DIGEST_LEN, REND_NEGO_ID_LEN);
+
+  /* Copy in the ciphertext */
+  rv->ciphertext_len = request_len - (DIGEST_LEN+REND_NEGO_ID_LEN);
+  rv->ciphertext = tor_malloc(rv->ciphertext_len);
+  memcpy(rv->ciphertext, request + DIGEST_LEN + REND_NEGO_ID_LEN,
+          rv->ciphertext_len);
+
+  goto done;
+
+ err:
+  if (rv) rend_service_free_intro(rv);
+  rv = NULL;
+  if (err_msg_out && !err_msg) {
+    tor_asprintf(&err_msg,
+                 "unknown INTRODUCE%d error",
+                 (int)type);
+  }
+
+ done:
+  if (err_msg_out) *err_msg_out = err_msg;
+  else tor_free(err_msg);
+
+  return rv;
+}
+
+static int
+rend_service_decrypt_intro_cell(
+    rend_intro_cell_t *intro,
+    crypto_pk_t *key,
+    char **err_msg_out)
+{
+  char *err_msg = NULL;
+  uint8_t key_digest[DIGEST_LEN];
+  char service_id[REND_SERVICE_ID_LEN_BASE32+1];
+  ssize_t key_len;
+  uint8_t buf[RELAY_PAYLOAD_SIZE];
+  int result, status = 0;
+
+  if (!intro || !key) {
+    if (err_msg_out) {
+      err_msg =
+        tor_strdup("rend_service_decrypt_intro_cell() called with bad "
+                   "parameters");
+    }
+
+    status = -2;
+    goto err;
+  }
+
+  /* Make sure we have ciphertext */
+  if (!(intro->ciphertext) || intro->ciphertext_len <= 0) {
+    if (err_msg_out) {
+      tor_asprintf(&err_msg,
+                   "rend_intro_cell_t was missing ciphertext for "
+                   "INTRODUCE%d cell",
+                   (int)(intro->type));
+    }
+    status = -3;
+    goto err;
+  }
+
+  /* Check that this cell actually matches this service key */
+
+  /* first DIGEST_LEN bytes of request is intro or service pk digest */
+  crypto_pk_get_digest(key, (char *)key_digest);
+  if (tor_memneq(key_digest, intro->pk, DIGEST_LEN)) {
+    if (err_msg_out) {
+      base32_encode(service_id, REND_SERVICE_ID_LEN_BASE32 + 1,
+                    (char*)(intro->pk), REND_SERVICE_ID_LEN);
+      tor_asprintf(&err_msg,
+                   "got an INTRODUCE%d cell for the wrong service (%s)",
+                   (int)(intro->type),
+                   escaped(service_id));
+    }
+
+    status = -4;
+    goto err;
+  }
+
+  /* Make sure the encrypted part is long enough to decrypt */
+
+  key_len = crypto_pk_keysize(key);
+  if (intro->ciphertext_len < key_len) {
+    if (err_msg_out) {
+      tor_asprintf(&err_msg,
+                   "got an INTRODUCE%d cell with a truncated PK-encrypted "
+                   "part",
+                   (int)(intro->type));
+    }
+
+    status = -5;
+    goto err;
+  }
+
+  /* Decrypt the encrypted part */
+
+  note_crypto_pk_op(REND_SERVER);
+  result =
+    crypto_pk_private_hybrid_decrypt(
+       key, (char *)buf, sizeof(buf),
+       (const char *)(intro->ciphertext), intro->ciphertext_len,
+       PK_PKCS1_OAEP_PADDING, 1);
+  if (result < 0) {
+    if (err_msg_out) {
+      tor_asprintf(&err_msg,
+                   "couldn't decrypt INTRODUCE%d cell",
+                   (int)(intro->type));
+    }
+    status = -6;
+    goto err;
+  }
+  intro->plaintext_len = result;
+  intro->plaintext = tor_malloc(intro->plaintext_len);
+  memcpy(intro->plaintext, buf, intro->plaintext_len);
+
+  goto done;
+
+ err:
+  if (err_msg_out && !err_msg) {
+    tor_asprintf(&err_msg,
+                 "unknown INTRODUCE%d error decrypting encrypted part",
+                 (int)(intro->type));
+  }
+  if (status >= 0) status = -1;
+
+ done:
+  if (err_msg_out) *err_msg_out = err_msg;
+  else tor_free(err_msg);
+
+  /* clean up potentially sensitive material */
+  memwipe(buf, 0, sizeof(buf));
+  memwipe(key_digest, 0, sizeof(key_digest));
+  memwipe(service_id, 0, sizeof(service_id));
+
+  return status;
+}
+
+static int
+rend_service_parse_intro_plaintext_hash_ra(
+    rend_intro_cell_t *intro,
+    char **err_msg_out)
+{
+  char *err_msg = NULL;
+  uint8_t version;
+  int status = 0;
+
+  if (!intro) {
+    if (err_msg_out) {
+      err_msg =
+        tor_strdup("rend_service_parse_intro_plaintext() called with NULL "
+                   "rend_intro_cell_t");
+    }
+
+    status = -2;
+    goto err;
+  }
+
+  /* Check that we have plaintext */
+  if (!(intro->plaintext) || intro->plaintext_len <= 0) {
+    if (err_msg_out) {
+      err_msg = tor_strdup("rend_intro_cell_t was missing plaintext");
+    }
+    status = -3;
+    goto err;
+  }
+
+  /* In all formats except v0, the first byte is a version number */
+  version = intro->plaintext[0];
+
+  /* v0 has no version byte (stupid...), so handle it as a fallback */
+  if (version > 4) version = 0;
+
+  /* Copy the version into the parsed cell structure */
+  intro->version = version;
+
+  memcpy(intro->u.v4.state.hash_ra, (uint8_t*)(intro->plaintext+2), DIGEST_LEN);
+  log_info(LD_REND, "+++ parsed hash ra cell: auth_type: %d, nego_id: %s, "
+                    "rand_hash: %s\n",
+                    (int)intro->plaintext[1],
+                    describe_nego_id(intro->u.v4.state.nego_id),
+                    describe_hash_ra(&intro->u.v4.state));
+
+  /* Flag it as being fully parsed */
+  intro->parsed = 1;
+
+  goto done;
+
+ err:
+  if (err_msg_out && !err_msg) {
+    tor_asprintf(&err_msg,
+                 "unknown INTRODUCE%d error parsing encrypted part",
+                 (int)(intro->type));
+  }
+  if (status >= 0) status = -1;
+
+ done:
+  if (err_msg_out) *err_msg_out = err_msg;
+  else tor_free(err_msg);
+
+  return status;
+}
+
+
+int
+rend_service_introduce_hash_ra(origin_circuit_t *introcirc,
+                               const uint8_t *request,
+                               size_t request_len)
+{
+  size_t payload_len;
+  int result = 0;
+  char *err_msg = NULL;
+  crypto_pk_t *intro_key = NULL;
+  rend_service_t *service = NULL;
+  /* Parsed cell */
+  rend_intro_cell_t *parsed_req = NULL;
+  char serviceid[REND_SERVICE_ID_LEN_BASE32+1];
+  char payload[RELAY_PAYLOAD_SIZE];
+  nego_state_t *nego_state = NULL;
+
+  log_info(LD_REND, "Received INTRODUCE_HASH_RA2 cell for on circ %u.",
+      (unsigned) introcirc->base_.n_circ_id);
+
+  /* We'll use this in a bazillion log messages */
+  base32_encode(serviceid, REND_SERVICE_ID_LEN_BASE32+1,
+                introcirc->rend_data->rend_pk_digest, REND_SERVICE_ID_LEN);
+
+  /* look up service depending on introcirc. */
+  service = rend_service_get_by_pk_digest(introcirc->rend_data->rend_pk_digest);
+  if (!service) {
+    log_warn(LD_BUG,
+             "Internal error: Got an INTRODUCE2 cell on an intro "
+             "circ for an unrecognized service %s.",
+             escaped(serviceid));
+    goto log_error;
+  }
+
+  /* use intro key instead of service key. */
+  intro_key = introcirc->intro_key;
+
+  /* Early parsing pass (get pk, ciphertext); type 2 is INTRODUCE2 */
+  parsed_req =
+    rend_service_begin_parse_intro_cell(request, request_len, 2, &err_msg);
+  if (!parsed_req) {
+    log_info(LD_REND, "rend_service_begin_parse_intro_cell() failed");
+    goto log_error;
+  } else if (err_msg) {
+    log_info(LD_REND, "%s on circ %u.", err_msg,
+             (unsigned)introcirc->base_.n_circ_id);
+    tor_free(err_msg);
+  }
+
+  if (nego_state_map
+        && digestmap_get(nego_state_map, parsed_req->u.v4.state.nego_id)) {
+    log_info(LD_REND, "Got dulplicate nego ID!");
+    goto log_error;
+  }
+
+  /* Now try to decrypt it */
+  log_info(LD_REND, "decrypting hash_ra data...");
+  result = rend_service_decrypt_intro_cell(parsed_req, intro_key, &err_msg);
+  if (result < 0) {
+    log_info(LD_REND, "parse req failed");
+    goto log_error;
+  } else if (err_msg) {
+    log_info(LD_REND, "%s on circ %u.", err_msg,
+             (unsigned)introcirc->base_.n_circ_id);
+    tor_free(err_msg);
+  }
+
+  /* Parse the plaintext */
+  log_info(LD_REND, "parsing hash_ra data...");
+  result = rend_service_parse_intro_plaintext_hash_ra(parsed_req, &err_msg);
+  if (result < 0) {
+    log_info(LD_REND, "decrypt failed");
+    goto log_error;
+  } else if (err_msg) {
+    log_info(LD_REND, "%s on circ %u.", err_msg,
+             (unsigned)introcirc->base_.n_circ_id);
+    tor_free(err_msg);
+  }
+
+  nego_state = tor_malloc_zero(sizeof(nego_state_t));
+  memcpy(nego_state, &parsed_req->u.v4.state, sizeof(nego_state_t));
+  nego_state->is_client = 0;
+
+  /* write nego id to payload */
+  memcpy(payload, nego_state->nego_id, REND_NEGO_ID_LEN);
+  /* generate RB */
+  /*nego_state->rb = 4567;*/
+  crypto_rand((char *)&nego_state->rb, sizeof(nego_state->rb));
+  set_uint64(payload+REND_NEGO_ID_LEN, nego_state->rb);
+  payload_len = REND_NEGO_ID_LEN + sizeof(uint64_t);
+  /* now send rb */
+  log_info(LD_REND, "sending rb data...");
+  if (relay_send_command_from_edge(0, TO_CIRCUIT(introcirc),
+                                   RELAY_COMMAND_INTRODUCE_RB1,
+                                   payload, payload_len,
+                                   introcirc->cpath->prev)<0) {
+    /* introcirc is already marked for close. leave rendcirc alone. */
+    log_warn(LD_BUG, "Couldn't send INTRODUCE_RB1 cell");
+    goto log_error;
+  }
+
+  /* insert nego state into hash map */
+  log_info(LD_REND, "inserting nego state into HT for %s...",
+      describe_nego_id(nego_state->nego_id));
+  if (!nego_state_map)
+    nego_state_map = digestmap_new();
+  digestmap_set(nego_state_map, nego_state->nego_id, nego_state);
+
+  if (parsed_req) {
+    rend_service_free_intro(parsed_req);
+    parsed_req = NULL;
+  }
+
+  return 0;
+
+ log_error:
+  tor_free(nego_state);
+  if (parsed_req) {
+    rend_service_free_intro(parsed_req);
+    parsed_req = NULL;
+  }
+  log_warn(LD_REND, "error parsing INTRODUCE_HASH_RA2 cell!, service: %p, parsed_req: %p, result: %d", service, parsed_req, result);
+
+  return 1;
+}
+
+int
+rend_service_introduce_ra(origin_circuit_t *introcirc, const uint8_t *request,
+                       size_t request_len)
+{
+  int status = 0, flags, i;
+  /*int circ_needs_uptime = 0;*/
+  int result = 0;
+  int reason = END_CIRC_REASON_TORPROTOCOL;
+  char hash_ra_hex[HEX_DIGEST_LEN+1];
+  char *err_msg = NULL;
+  rend_data_t *rend_data;
+  nego_state_t *nego_state = NULL;
+  origin_circuit_t *rp_circ = NULL;
+  const char *rend_cookie;
+  const char *dh_key;
+  extend_info_t *rp_info = NULL;
+  char hexcookie[9];
+  rend_service_t *service = NULL;
+  crypto_dh_t *dh = NULL;
+  crypt_path_t *cpath = NULL;
+  char serviceid[REND_SERVICE_ID_LEN_BASE32+1];
+  char keys[DIGEST_LEN+CPATH_KEY_MATERIAL_LEN]; /* Holds KH, Df, Db, Kf, Kb */
+  time_t now = time(NULL);
+  rend_intro_cell_t *parsed_req = NULL;
+  crypto_pk_t *intro_key = NULL;
+  size_t rd_shift;
+  char hash_ra[DIGEST_LEN];
+  const node_t *rp;
+  (void) request_len;
+
+  log_info(LD_REND, "Received INTRODUCE_RA2 cell for on circ %u. length: %zu",
+      (unsigned) introcirc->base_.n_circ_id, request_len);
+
+  base32_encode(serviceid, REND_SERVICE_ID_LEN_BASE32+1,
+                introcirc->rend_data->rend_pk_digest, REND_SERVICE_ID_LEN);
+
+  rend_data = introcirc->rend_data;
+  /* look up service depending on circuit. */
+  service = rend_service_get_by_pk_digest(rend_data->rend_pk_digest);
+  if (!service) {
+    log_warn(LD_BUG,
+             "Internal error: Got an INTRODUCE_RA2 cell on an intro "
+             "circ for an unrecognized service %s.",
+             escaped(serviceid));
+    goto err;
+  }
+
+  /* use intro key instead of service key. */
+  intro_key = introcirc->intro_key;
+
+  /* Early parsing pass (get pk, ciphertext); type 2 is INTRODUCE2 */
+  parsed_req =
+    rend_service_begin_parse_intro_cell(request, request_len, 2, &err_msg);
+  if (!parsed_req) {
+    log_info(LD_REND, "parse req failed");
+    goto err;
+  } else if (err_msg) {
+    log_info(LD_REND, "%s on circ %u.", err_msg,
+             (unsigned)introcirc->base_.n_circ_id);
+    tor_free(err_msg);
+  }
+
+  /* Now try to decrypt it */
+  log_info(LD_REND, "decrypting RA data...");
+  result = rend_service_decrypt_intro_cell(parsed_req, intro_key, &err_msg);
+  if (result < 0) {
+    log_info(LD_REND, "decrypt failed");
+    goto err;
+  } else if (err_msg) {
+    log_info(LD_REND, "%s on circ %u.", err_msg,
+             (unsigned)introcirc->base_.n_circ_id);
+    tor_free(err_msg);
+  }
+
+  rd_shift = DIGEST_LEN;
+  /* retrieve negotiation state */
+  log_info(LD_REND, "searching for nego state %s...",
+            describe_nego_id(parsed_req->u.v4.state.nego_id));
+  nego_state = digestmap_get(nego_state_map, parsed_req->u.v4.state.nego_id);
+  if (!nego_state) {
+    log_warn(LD_REND, "Got invalid negotiation ID!");
+    goto err;
+  }
+
+  rd_shift = 0;
+  /* read and validate ra against hash_ra */
+  nego_state->ra = get_uint64(parsed_req->plaintext+rd_shift);
+  crypto_digest(hash_ra, (char *)&nego_state->ra, sizeof(nego_state->ra));
+  if (tor_memneq(hash_ra, nego_state->hash_ra, DIGEST_LEN)) {
+    log_warn(LD_REND, "Got invalid RA %lu for HASH_RA: %s!",
+        nego_state->ra,
+        describe_hash_ra(nego_state));
+    goto err;
+  }
+  rd_shift += sizeof(uint64_t);
+
+  rend_cookie = (const char *)(parsed_req->plaintext+rd_shift);
+  rd_shift += REND_COOKIE_LEN;
+
+  dh_key = (const char *)(parsed_req->plaintext+rd_shift);
+
+  base16_encode(hexcookie, 9, (const char *)(rend_cookie), 4);
+  base32_encode(hash_ra_hex, sizeof(hash_ra_hex),
+                (char *)nego_state->hash_ra, DIGEST_LEN);
+  log_info(LD_REND, "cookie: %s, RA to verify: hash(%lu) == %s",
+          hexcookie, nego_state->ra, hash_ra_hex);
+
+  rp = rend_get_rp_from_ra_rb(nego_state);
+  log_info(LD_REND, "ra: %lu, rb: %lu, Calculated RP: %s",
+      nego_state->ra,
+      nego_state->rb,
+      node_describe(rp));
+
+  /* negotiation done, remove nego state from hashmap, it will be freed
+   * at the end of this function */
+  digestmap_remove(nego_state_map, parsed_req->u.v4.state.nego_id);
+
+  /* Try DH handshake... */
+  dh = crypto_dh_new(DH_TYPE_REND);
+  if (!dh || crypto_dh_generate_public(dh)<0) {
+    log_warn(LD_BUG,"Internal error: couldn't build DH state "
+             "or generate public key.");
+    reason = END_CIRC_REASON_INTERNAL;
+    goto err;
+  }
+  if (crypto_dh_compute_secret(LOG_PROTOCOL_WARN, dh,
+                               /*(char *)(parsed_req->dh),*/
+                               dh_key,
+                               DH_KEY_LEN, keys,
+                               DIGEST_LEN+CPATH_KEY_MATERIAL_LEN)<0) {
+    log_warn(LD_BUG, "Internal error: couldn't complete DH handshake");
+    reason = END_CIRC_REASON_INTERNAL;
+    goto err;
+  }
+
+  /* Launch a circuit to negotiated rendezvous point. */
+  rp_info = extend_info_from_node(rp, 0);
+
+  for (i = 0; i < MAX_REND_FAILURES; i++) {
+    /*@TODO fix flag here  23.02 2014 (houqp)*/
+    /*flags = CIRCLAUNCH_NEED_CAPACITY | CIRCLAUNCH_IS_INTERNAL;*/
+    /*if (circ_needs_uptime) flags |= CIRCLAUNCH_NEED_UPTIME;*/
+    flags = CIRCLAUNCH_IS_INTERNAL;
+    rp_circ = circuit_launch_by_extend_info(
+                        CIRCUIT_PURPOSE_5H_CONNECT_REND,
+                        rp_info,
+                        flags);
+    if (rp_circ)
+      break;
+  }
+
+  if (!rp_circ) { /* give up */
+    log_warn(LD_REND, "Giving up launching first hop of circuit to rendezvous "
+             "point %s for service %s.",
+             safe_str_client(extend_info_describe(rp_info)),
+             serviceid);
+    reason = END_CIRC_REASON_CONNECTFAILED;
+    goto err;
+  }
+  log_info(LD_REND,
+           "Accepted intro; launched circuit to %s "
+           "(cookie %s) for service %s.",
+           safe_str_client(extend_info_describe(rp_info)),
+           hexcookie, serviceid);
+  tor_assert(rp_circ->build_state);
+  /* Fill in the circuit's state. */
+  rp_circ->rend_data = tor_malloc_zero(sizeof(rend_data_t));
+  memcpy(rp_circ->rend_data->rend_pk_digest,
+         rend_data->rend_pk_digest,
+         DIGEST_LEN);
+  memcpy(rp_circ->rend_data->rend_cookie, rend_cookie, REND_COOKIE_LEN);
+  strlcpy(rp_circ->rend_data->onion_address, service->service_id,
+          sizeof(rp_circ->rend_data->onion_address));
+  memcpy(&rp_circ->rend_data->nego_state, nego_state, sizeof(nego_state_t));
+  rp_circ->rend_data->nego_state.is_client = 0;
+
+  rp_circ->build_state->service_pending_final_cpath_ref =
+    tor_malloc_zero(sizeof(crypt_path_reference_t));
+  rp_circ->build_state->service_pending_final_cpath_ref->refcount = 1;
+
+  rp_circ->build_state->service_pending_final_cpath_ref->cpath = cpath =
+    tor_malloc_zero(sizeof(crypt_path_t));
+  cpath->magic = CRYPT_PATH_MAGIC;
+  rp_circ->build_state->expiry_time = now + MAX_REND_TIMEOUT;
+
+  cpath->rend_dh_handshake_state = dh;
+  dh = NULL;
+  if (circuit_init_cpath_crypto(cpath, keys+DIGEST_LEN, 1)<0)
+    goto err;
+  memcpy(cpath->rend_circ_nonce, keys, DIGEST_LEN);
+
+  goto done;
+
+ err:
+  log_warn(LD_REND, "error parsing INTRODUCE_RA2 cell!, service: %p, parsed_req: %p, result: %d", service, parsed_req, result);
+  status = -1;
+  if (dh) crypto_dh_free(dh);
+  if (rp_circ) {
+    circuit_mark_for_close(TO_CIRCUIT(rp_circ), reason);
+  }
+  tor_free(err_msg);
+
+ done:
+  tor_free(rp_info);
+  tor_free(nego_state);
+  memwipe(keys, 0, sizeof(keys));
+  memwipe(serviceid, 0, sizeof(serviceid));
+  memwipe(hexcookie, 0, sizeof(hexcookie));
+
+  /* Free the parsed cell */
+  if (parsed_req) {
+    rend_service_free_intro(parsed_req);
+    parsed_req = NULL;
+  }
+
+#if 0
+  /* Free rp if we must */
+  if (need_rp_free) extend_info_free(rp);
+#endif
+
+  return status;
+}
+
 /** Respond to an INTRODUCE2 cell by launching a circuit to the chosen
  * rendezvous point.
  */
@@ -1346,7 +1930,6 @@ rend_service_introduce(origin_circuit_t *circuit, const uint8_t *request,
     if (circ_needs_uptime) flags |= CIRCLAUNCH_NEED_UPTIME;
     launched = circuit_launch_by_extend_info(
                         CIRCUIT_PURPOSE_S_CONNECT_REND, rp, flags);
-
     if (launched)
       break;
   }
@@ -1548,6 +2131,8 @@ rend_service_free_intro(rend_intro_cell_t *request)
 
         extend_info_free(request->u.v3.extend_info);
         request->u.v3.extend_info = NULL;
+        break;
+      case 4:
         break;
       default:
         log_info(LD_BUG,

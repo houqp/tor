@@ -1317,6 +1317,7 @@ new_route_len(uint8_t purpose, extend_info_t *exit, smartlist_t *nodes)
 
   routelen = DEFAULT_ROUTE_LEN;
   if (exit &&
+      purpose != CIRCUIT_PURPOSE_5H_CONNECT_REND &&
       purpose != CIRCUIT_PURPOSE_TESTING &&
       purpose != CIRCUIT_PURPOSE_S_ESTABLISH_INTRO)
     routelen++;
@@ -1709,6 +1710,7 @@ warn_if_last_router_excluded(origin_circuit_t *circ, const extend_info_t *exit)
     case CIRCUIT_PURPOSE_S_CONNECT_REND:
     case CIRCUIT_PURPOSE_S_REND_JOINED:
     case CIRCUIT_PURPOSE_TESTING:
+    case CIRCUIT_PURPOSE_5H_CONNECT_REND:
       return;
     case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
     case CIRCUIT_PURPOSE_C_REND_READY:

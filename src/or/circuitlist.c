@@ -551,6 +551,8 @@ circuit_purpose_to_controller_hs_state_string(uint8_t purpose)
       return "HSCR_ESTABLISHED_WAITING";
     case CIRCUIT_PURPOSE_C_REND_JOINED:
       return "HSCR_JOINED";
+    case CIRCUIT_PURPOSE_5H_CONNECT_REND:
+      return "HSCR_5H_CONNECT_REND";
 
     case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
       return "HSSI_CONNECTING";
@@ -607,6 +609,8 @@ circuit_purpose_to_string(uint8_t purpose)
       return "Hidden service: Connecting to rendezvous point";
     case CIRCUIT_PURPOSE_S_REND_JOINED:
       return "Hidden service: Active rendezvous point";
+    case CIRCUIT_PURPOSE_5H_CONNECT_REND:
+      return "Hidden service: Connection to rendezvous point (5Hop)";
 
     case CIRCUIT_PURPOSE_TESTING:
       return "Testing circuit";

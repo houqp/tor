@@ -10,6 +10,7 @@
 
 #include "or.h"
 #include "circuitbuild.h"
+#include "circuitlist.h"
 #include "config.h"
 #include "rendclient.h"
 #include "rendcommon.h"
@@ -18,6 +19,10 @@
 #include "rephist.h"
 #include "routerlist.h"
 #include "routerparse.h"
+#include "networkstatus.h"
+#include "nodelist.h"
+#include "relay.h"
+#include "circuituse.h"
 
 /** Return 0 if one and two are the same service ids, else -1 or 1 */
 int
@@ -1227,6 +1232,40 @@ rend_process_relay_cell(circuit_t *circ, const crypt_path_t *layer_hint,
       if (origin_circ)
         r = rend_client_introduction_acked(origin_circ,payload,length);
       break;
+      /*
+       * start of 5hop hs
+       */
+    case RELAY_COMMAND_INTRODUCE_HASH_RA1:
+      if (or_circ)
+        r = rend_mid_introduce_hash_ra(or_circ,payload,length);
+      break;
+    case RELAY_COMMAND_INTRODUCE_HASH_RA2:
+      if (origin_circ)
+        r = rend_service_introduce_hash_ra(origin_circ,payload,length);
+      break;
+    case RELAY_COMMAND_INTRODUCE_RB1:
+      if (or_circ)
+        r = rend_mid_introduce_rb(or_circ,payload,length);
+      break;
+    case RELAY_COMMAND_INTRODUCE_RB2:
+      if (origin_circ)
+        r = rend_client_introduce_rb(origin_circ,payload,length);
+      break;
+    case RELAY_COMMAND_INTRODUCE_RA1:
+      if (or_circ)
+        r = rend_mid_introduce_ra(or_circ,payload,length);
+      break;
+    case RELAY_COMMAND_INTRODUCE_RA2:
+      if (origin_circ)
+        r = rend_service_introduce_ra(origin_circ,payload,length);
+      break;
+    case RELAY_COMMAND_5HOP_ESTABLISH_RENDEZVOUS:
+      if (or_circ)
+        r = rend_mid_5hop_rendezvous(or_circ,payload,length);
+      break;
+      /*
+       * end of 5hop hs
+       */
     case RELAY_COMMAND_RENDEZVOUS1:
       if (or_circ)
         r = rend_mid_rendezvous(or_circ,payload,length);
@@ -1260,4 +1299,142 @@ rend_data_dup(const rend_data_t *data)
   tor_assert(data);
   return tor_memdup(data, sizeof(rend_data_t));
 }
+
+const node_t *
+rend_get_rp_from_ra_rb(nego_state_t *nego_state)
+{
+  int start, found;
+  uint64_t r;
+  char rand_digest[DIGEST_LEN];
+  networkstatus_t *c;
+  routerstatus_t *or;
+
+  r = nego_state->ra + nego_state->rb;
+  crypto_digest(rand_digest, (char *)&r, sizeof(r));
+
+  c = networkstatus_get_latest_consensus();
+  start = networkstatus_vote_find_entry_idx(
+      c,
+      rand_digest,
+      &found);
+
+  if (start == smartlist_len(c->routerstatus_list))
+    start = 0;
+
+  or = smartlist_get(c->routerstatus_list, start);
+
+  return node_get_by_id(or->identity_digest);
+}
+
+const char *
+describe_hash_ra(nego_state_t *nego_state)
+{
+  static char hash_ra_hex[HEX_DIGEST_LEN+1];
+
+  base32_encode(hash_ra_hex, sizeof(hash_ra_hex),
+                (char *)nego_state->hash_ra, DIGEST_LEN);
+
+  return hash_ra_hex;
+}
+
+const char *
+describe_nego_id(const char *nego_id)
+{
+  static char nego_id_hex[REND_NEGO_ID_LEN*2+1];
+
+  base32_encode(nego_id_hex, sizeof(nego_id_hex),
+                (char *)nego_id, REND_NEGO_ID_LEN);
+
+  return nego_id_hex;
+}
+
+void
+rend_common_rendezvous_has_opened(origin_circuit_t *circ)
+{
+  char buf[RELAY_PAYLOAD_SIZE];
+  int reason = END_CIRC_REASON_TORPROTOCOL;
+  int buf_len = 0;
+  crypt_path_t *hop = NULL;
+  nego_state_t *nego_state;
+
+  tor_assert(circ->base_.purpose == CIRCUIT_PURPOSE_5H_CONNECT_REND);
+
+  /* Declare the circ dirty to avoid reuse, and for path-bias */
+  if (!circ->base_.timestamp_dirty)
+    circ->base_.timestamp_dirty = time(NULL);
+
+  /* if we are client, only send rend cookie
+   * if we are server, send rend cookie + dh key + digest */
+  nego_state = &circ->rend_data->nego_state;
+  log_info(LD_REND,"Rendcirc (%u) has opened for %s",
+            circ->base_.n_circ_id,
+            nego_state->is_client? "client" : "server");
+
+  memcpy(buf, circ->rend_data->rend_cookie, REND_COOKIE_LEN);
+  buf_len += REND_COOKIE_LEN;
+
+  if (!nego_state->is_client) {
+    /* we are the server */
+    hop = circ->build_state->service_pending_final_cpath_ref->cpath;
+    circ->build_state->pending_final_cpath = hop;
+    circ->build_state->service_pending_final_cpath_ref->cpath = NULL;
+    tor_assert(hop);
+    /* set dh pub key */
+    if (crypto_dh_get_public(hop->rend_dh_handshake_state,
+                             buf+REND_COOKIE_LEN, DH_KEY_LEN)<0) {
+      log_warn(LD_GENERAL,"Couldn't get DH public key.");
+      reason = END_CIRC_REASON_INTERNAL;
+      goto err;
+    }
+    buf_len += DH_KEY_LEN;
+    /* set nonce */
+    memcpy(buf+REND_COOKIE_LEN+DH_KEY_LEN, hop->rend_circ_nonce,
+           DIGEST_LEN);
+    buf_len += DIGEST_LEN;
+  }
+
+  log_info(LD_REND, "sending 5HOP_ESTABLISH_RENDEZVOUS cell!!!!!");
+  /* Send the cell, RP will check the length to decide whether it's a client
+   * or server */
+  if (relay_send_command_from_edge(0, TO_CIRCUIT(circ),
+                                   RELAY_COMMAND_5HOP_ESTABLISH_RENDEZVOUS,
+                                   buf, buf_len,
+                                   circ->cpath->prev)<0) {
+    log_warn(LD_GENERAL, "Couldn't send RENDEZVOUS1 cell.");
+    reason = END_CIRC_REASON_INTERNAL;
+    goto err;
+  }
+
+  if (!nego_state->is_client) {
+    tor_assert(hop);
+    crypto_dh_free(hop->rend_dh_handshake_state);
+    hop->rend_dh_handshake_state = NULL;
+
+    /* Append the cpath entry. */
+    hop->state = CPATH_STATE_OPEN;
+    /* set the windows to default. these are the windows
+     * that bob thinks alice has.
+     */
+    hop->package_window = circuit_initial_package_window();
+    hop->deliver_window = CIRCWINDOW_START;
+
+    onion_append_to_cpath(&circ->cpath, hop);
+    circ->build_state->pending_final_cpath = NULL; /* prevent double-free */
+
+    /* Change the circuit purpose. */
+    circuit_change_purpose(TO_CIRCUIT(circ), CIRCUIT_PURPOSE_S_REND_JOINED);
+  }
+
+  goto done;
+
+ err:
+  circuit_mark_for_close(TO_CIRCUIT(circ), reason);
+ done:
+  memwipe(buf, 0, sizeof(buf));
+  /*memwipe(serviceid, 0, sizeof(serviceid));*/
+  /*memwipe(hexcookie, 0, sizeof(hexcookie));*/
+
+  return;
+}
+
 

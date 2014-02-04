@@ -64,5 +64,9 @@ void rend_get_descriptor_id_bytes(char *descriptor_id_out,
                                   const char *service_id,
                                   const char *secret_id_part);
 
+const node_t *rend_get_rp_from_ra_rb(nego_state_t *intro_state);
+const char *describe_hash_ra(nego_state_t *intro_state);
+const char *describe_nego_id(const char *nego_id);
+void rend_common_rendezvous_has_opened(origin_circuit_t *circ);
 #endif
 

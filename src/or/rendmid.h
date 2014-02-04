@@ -21,5 +21,17 @@ int rend_mid_establish_rendezvous(or_circuit_t *circ, const uint8_t *request,
 int rend_mid_rendezvous(or_circuit_t *circ, const uint8_t *request,
                         size_t request_len);
 
+int
+rend_mid_introduce_rb(or_circuit_t *circ, const uint8_t *request,
+                            size_t request_len);
+
+int
+rend_mid_introduce_hash_ra(or_circuit_t *circ, const uint8_t *request,
+                            size_t request_len);
+int
+rend_mid_introduce_ra(or_circuit_t *circ, const uint8_t *request,
+                            size_t request_len);
+int rend_mid_5hop_rendezvous(or_circuit_t *circ, const uint8_t *request,
+                            size_t request_len);
 #endif
 

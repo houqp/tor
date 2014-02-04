@@ -540,7 +540,9 @@ typedef enum {
 #define CIRCUIT_PURPOSE_CONTROLLER 19
 /** This circuit is used for path bias probing only */
 #define CIRCUIT_PURPOSE_PATH_BIAS_TESTING 20
-#define CIRCUIT_PURPOSE_MAX_ 20
+
+#define CIRCUIT_PURPOSE_5H_CONNECT_REND 21
+#define CIRCUIT_PURPOSE_MAX_ 21
 /** A catch-all for unrecognized purposes. Currently we don't expect
  * to make or see any circuits with this purpose. */
 #define CIRCUIT_PURPOSE_UNKNOWN 255
@@ -594,6 +596,14 @@ typedef enum {
 #define RELAY_COMMAND_INTRO_ESTABLISHED 38
 #define RELAY_COMMAND_RENDEZVOUS_ESTABLISHED 39
 #define RELAY_COMMAND_INTRODUCE_ACK 40
+
+#define RELAY_COMMAND_INTRODUCE_HASH_RA1 42
+#define RELAY_COMMAND_INTRODUCE_HASH_RA2 43
+#define RELAY_COMMAND_INTRODUCE_RB1 44
+#define RELAY_COMMAND_INTRODUCE_RB2 45
+#define RELAY_COMMAND_INTRODUCE_RA1 46
+#define RELAY_COMMAND_INTRODUCE_RA2 47
+#define RELAY_COMMAND_5HOP_ESTABLISH_RENDEZVOUS 48
 
 /* Reasons why an OR connection is closed. */
 #define END_OR_CONN_REASON_DONE           1
@@ -781,6 +791,8 @@ typedef enum {
  * rendezvous point. */
 #define REND_COOKIE_LEN DIGEST_LEN
 
+#define REND_NEGO_ID_LEN DIGEST_LEN
+
 /** Client authorization type that a hidden service performs. */
 typedef enum rend_auth_type_t {
   REND_NO_AUTH      = 0,
@@ -794,6 +806,14 @@ typedef struct rend_service_authorization_t {
   char onion_address[REND_SERVICE_ADDRESS_LEN+1];
   rend_auth_type_t auth_type;
 } rend_service_authorization_t;
+
+typedef struct nego_state_s {
+  char nego_id[REND_NEGO_ID_LEN];
+  uint8_t hash_ra[DIGEST_LEN];
+  uint64_t ra;
+  uint64_t rb;
+  int is_client;
+} nego_state_t;
 
 /** Client- and server-side data that is used for hidden service connection
  * establishment. Not all fields contain data depending on where this struct
@@ -813,6 +833,9 @@ typedef struct rend_data_t {
 
   /** Rendezvous cookie used by both, client and service. */
   char rend_cookie[REND_COOKIE_LEN];
+
+  /** state for 5hop introduction RP negotiation */
+  nego_state_t nego_state;
 } rend_data_t;
 
 /** Time interval for tracking replays of DH public keys received in
@@ -2940,6 +2963,7 @@ typedef enum {
 } path_state_t;
 #define path_state_bitfield_t ENUM_BF(path_state_t)
 
+
 /** An origin_circuit_t holds data necessary to build and use a circuit.
  */
 typedef struct origin_circuit_t {
@@ -3173,8 +3197,10 @@ typedef struct or_circuit_t {
    * is not marked for close. */
   struct or_circuit_t *rend_splice;
 
-#if REND_COOKIE_LEN >= DIGEST_LEN
+#if REND_COOKIE_LEN >= DIGEST_LEN && REND_COOKIE_LEN >= REND_NEGO_ID_LEN
 #define REND_TOKEN_LEN REND_COOKIE_LEN
+#elif REND_NEGO_ID_LEN >= DIGEST_LEN && REND_NEGO_ID_LEN > REND_COOKIE_LEN
+#define REND_TOKEN_LEN REND_NEGO_ID_LEN
 #else
 #define REND_TOKEN_LEN DIGEST_LEN
 #endif
@@ -3189,6 +3215,10 @@ typedef struct or_circuit_t {
   /* ???? move to a subtype or adjunct structure? Wastes 20 bytes -NM */
   /** Stores KH for the handshake. */
   char rend_circ_nonce[DIGEST_LEN];/* KH in tor-spec.txt */
+
+  /* used by rendezvous point to remember rend cookie */
+  char *rend_request;
+  size_t rend_request_len;
 
   /** How many more relay_early cells can we send on this circuit, according
    * to the specification? */

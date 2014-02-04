@@ -275,7 +275,10 @@ circuit_get_best(const entry_connection_t *conn,
 
   tor_assert(conn);
 
+  /* CIRCUIT_PURPOSE_C_INTRODUCE_ACKED is added here because we will look it up
+   * after a rend circuit is established. (houqp)*/
   tor_assert(purpose == CIRCUIT_PURPOSE_C_GENERAL ||
+             purpose == CIRCUIT_PURPOSE_C_INTRODUCE_ACKED ||
              purpose == CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT ||
              purpose == CIRCUIT_PURPOSE_C_REND_JOINED);
 
@@ -1315,6 +1318,9 @@ circuit_has_opened(origin_circuit_t *circ)
     case CIRCUIT_PURPOSE_TESTING:
       circuit_testing_opened(circ);
       break;
+    case CIRCUIT_PURPOSE_5H_CONNECT_REND:
+      /* either at Bob or Alice, connecting to rend point */
+      rend_common_rendezvous_has_opened(circ);
     /* default:
      * This won't happen in normal operation, but might happen if the
      * controller did it. Just let it slide. */
@@ -1508,7 +1514,10 @@ circuit_launch_by_extend_info(uint8_t purpose,
   }
 
   if ((extend_info || purpose != CIRCUIT_PURPOSE_C_GENERAL) &&
-      purpose != CIRCUIT_PURPOSE_TESTING && !onehop_tunnel) {
+      purpose != CIRCUIT_PURPOSE_TESTING && !onehop_tunnel &&
+      /* 5H rend circuit cannot be cannibalized b/c it only needs
+       * 2 hops + exit RP */
+      purpose != CIRCUIT_PURPOSE_5H_CONNECT_REND) {
     /* see if there are appropriate circs available to cannibalize. */
     /* XXX if we're planning to add a hop, perhaps we want to look for
      * internal circs rather than exit circs? -RD */
@@ -1558,6 +1567,7 @@ circuit_launch_by_extend_info(uint8_t purpose,
       switch (purpose) {
         case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
         case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
+        case CIRCUIT_PURPOSE_5H_CONNECT_REND:
           /* it's ready right now */
           break;
         case CIRCUIT_PURPOSE_C_INTRODUCING:
@@ -2167,18 +2177,26 @@ connection_ap_handshake_attach_circuit(entry_connection_t *conn)
     tor_assert(!ENTRY_TO_EDGE_CONN(conn)->cpath_layer);
 
     /* start by finding a rendezvous circuit for us */
-
-    retval = circuit_get_open_circ_or_launch(
-       conn, CIRCUIT_PURPOSE_C_REND_JOINED, &rendcirc);
-    if (retval < 0) return -1; /* failed */
-
-    if (retval > 0) {
-      tor_assert(rendcirc);
+    rendcirc = circuit_get_best(conn, 1, CIRCUIT_PURPOSE_C_REND_JOINED, 0, 1);
+    log_info(LD_REND, "Joined rend circuit: %s found", rendcirc ? "":"not");
+    if (rendcirc) {
+      origin_circuit_t *introcirc;
       /* one is already established, attach */
       log_info(LD_REND,
                "rend joined circ %d already here. attaching. "
                "(stream %d sec old)",
                (unsigned)rendcirc->base_.n_circ_id, conn_age);
+
+      log_info(LD_REND, "Looking for related intro circuit ....");
+      introcirc = circuit_get_best(conn, 1,
+                                   CIRCUIT_PURPOSE_C_INTRODUCE_ACKED, 0, 1);
+      if (introcirc) {
+        log_info(LD_REND, "Don't need intro circuit anymore, close it....");
+        /*@TODO free other resources as well?  17.03 2014 (houqp)*/
+        /* close the intro circuit: we won't need it anymore. */
+        circuit_mark_for_close(TO_CIRCUIT(introcirc), END_CIRC_REASON_FINISHED);
+      }
+
       /* Mark rendezvous circuits as 'newly dirty' every time you use
        * them, since the process of rebuilding a rendezvous circ is so
        * expensive. There is a tradeoff between linkability and
@@ -2196,18 +2214,10 @@ connection_ap_handshake_attach_circuit(entry_connection_t *conn)
       return 1;
     }
 
-    if (rendcirc && (rendcirc->base_.purpose ==
-                     CIRCUIT_PURPOSE_C_REND_READY_INTRO_ACKED)) {
-      log_info(LD_REND,
-               "pending-join circ %u already here, with intro ack. "
-               "Stalling. (stream %d sec old)",
-               (unsigned)rendcirc->base_.n_circ_id, conn_age);
-      return 0;
-    }
-
+    log_info(LD_REND, "rend circuit not found, looking for intro circuit ...");
     /* it's on its way. find an intro circ. */
     retval = circuit_get_open_circ_or_launch(
-      conn, CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT, &introcirc);
+                conn, CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT, &introcirc);
     if (retval < 0) return -1; /* failed */
 
     if (retval > 0) {
@@ -2221,32 +2231,29 @@ connection_ap_handshake_attach_circuit(entry_connection_t *conn)
       return 0;
     }
 
-    /* now rendcirc and introcirc are each either undefined or not finished */
-
-    if (rendcirc && introcirc &&
-        rendcirc->base_.purpose == CIRCUIT_PURPOSE_C_REND_READY) {
+    /* now introcirc are either undefined or not finished, send introduction
+     * if needed */
+    if (introcirc) {
       log_info(LD_REND,
-               "ready rend circ %u already here (no intro-ack yet on "
+               "(no intro-ack yet on "
                "intro %u). (stream %d sec old)",
-               (unsigned)rendcirc->base_.n_circ_id,
                (unsigned)introcirc->base_.n_circ_id, conn_age);
 
       tor_assert(introcirc->base_.purpose == CIRCUIT_PURPOSE_C_INTRODUCING);
       if (introcirc->base_.state == CIRCUIT_STATE_OPEN) {
-        log_info(LD_REND,"found open intro circ %u (rend %u); sending "
+        log_info(LD_REND,"found open intro circ %u; sending "
                  "introduction. (stream %d sec old)",
                  (unsigned)introcirc->base_.n_circ_id,
-                 (unsigned)rendcirc->base_.n_circ_id,
                  conn_age);
-        switch (rend_client_send_introduction(introcirc, rendcirc)) {
+        switch (rend_client_send_5hop_introduction(introcirc, rendcirc)) {
         case 0: /* success */
-          rendcirc->base_.timestamp_dirty = time(NULL);
+          /*rendcirc->base_.timestamp_dirty = time(NULL);*/
           introcirc->base_.timestamp_dirty = time(NULL);
 
           pathbias_count_use_attempt(introcirc);
-          pathbias_count_use_attempt(rendcirc);
+          /*pathbias_count_use_attempt(rendcirc);*/
 
-          assert_circuit_ok(TO_CIRCUIT(rendcirc));
+          /*assert_circuit_ok(TO_CIRCUIT(rendcirc));*/
           assert_circuit_ok(TO_CIRCUIT(introcirc));
           return 0;
         case -1: /* transient error */
