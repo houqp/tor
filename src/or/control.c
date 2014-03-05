@@ -5088,6 +5088,28 @@ control_event_hs_descriptor_failed(const rend_data_t *rend_query,
   control_event_hs_descriptor_receive_end("FAILED", rend_query, id_digest);
 }
 
+/** send HS_DESC UPLOAD event
+ *
+ * called when a descriptor has been uploaded to selected
+ * hidden service directory.
+ */
+void
+control_event_hs_descriptor_upload(const char *onion_addr,
+                                     const char *desc_id,
+                                     const char *hsdir_fp,
+                                     int sec_valid)
+{
+  if (!onion_addr || !desc_id || !hsdir_fp) {
+    log_warn(LD_BUG, "Called with onion_addr==%p, desc_id==%p, hsdir_fp==%p",
+             onion_addr, desc_id, hsdir_fp);
+    return;
+  }
+  send_control_event(EVENT_HS_DESC, ALL_FORMATS,
+                     "650 HS_DESC UPLOAD %s NONE %s %s SEC_VALID=%d\r\n",
+                     onion_addr, node_describe_longname_by_id(hsdir_fp),
+                     desc_id, sec_valid);
+}
+
 /** Free any leftover allocated memory of the control.c subsystem. */
 void
 control_free_all(void)

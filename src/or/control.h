@@ -111,7 +111,10 @@ void control_event_hs_descriptor_received(const rend_data_t *rend_query,
                                           const char *hs_dir);
 void control_event_hs_descriptor_failed(const rend_data_t *rend_query,
                                         const char *hs_dir);
-
+void control_event_hs_descriptor_upload(const char *onion_address,
+                                        const char *desc_id,
+                                        const char *hsdir_fp,
+                                        int sec_valid);
 void control_free_all(void);
 
 #ifdef CONTROL_PRIVATE
