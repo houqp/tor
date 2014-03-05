@@ -11,6 +11,11 @@
 #include "test.h"
 #include "control.h"
 
+/* onion address for test */
+#define STR_HS_ADDR "ajhb7kljbiru65qo"
+/* id digest for hidden service directory */
+#define STR_HSDESC_ID "b3oeducbhjmbqmgw2i3jtz4fekkrinwj"
+
 /* mock ID digest and longname for node that's in nodelist */
 #define HSDIR_EXIST_ID "\xAA\xAA\xAA\xAA\xAA\xAA\xAA\xAA\xAA\xAA" \
                        "\xAA\xAA\xAA\xAA\xAA\xAA\xAA\xAA\xAA\xAA"
@@ -55,16 +60,12 @@ node_describe_longname_by_id_replacement(const char *id_digest)
   }
 }
 
-/** Make sure each hidden service descriptor async event generation
- *
- * function generates the message in expected format.
+/** Make sure each client side hidden service descriptor async event
+ * generation function generates the message in expected format.
  */
 static void
-test_hs_desc_event(void *arg)
+test_hs_client_desc_event(void *arg)
 {
-  #define STR_HS_ADDR "ajhb7kljbiru65qo"
-  #define STR_HS_ID "b3oeducbhjmbqmgw2i3jtz4fekkrinwj"
-
   rend_data_t rend_query;
   const char *expected_msg;
 
@@ -81,9 +82,9 @@ test_hs_desc_event(void *arg)
 
   /* test request event */
   control_event_hs_descriptor_requested(&rend_query, HSDIR_EXIST_ID,
-                                        STR_HS_ID);
+                                        STR_HSDESC_ID);
   expected_msg = "650 HS_DESC REQUESTED "STR_HS_ADDR" NO_AUTH "\
-                  STR_HSDIR_EXIST_LONGNAME" "STR_HS_ID"\r\n";
+                  STR_HSDIR_EXIST_LONGNAME" "STR_HSDESC_ID"\r\n";
   test_assert(received_msg);
   test_streq(received_msg, expected_msg);
   tor_free(received_msg);
@@ -121,8 +122,39 @@ test_hs_desc_event(void *arg)
   tor_free(received_msg);
 }
 
+/** Make sure each server side hidden service descriptor async event
+ * generation function generates the message in expected format.
+ */
+static void
+test_hs_server_desc_event(void *arg)
+{
+  const char *expected_msg;
+
+  (void) arg;
+  MOCK(send_control_event_string,
+       send_control_event_string_replacement);
+  MOCK(node_describe_longname_by_id,
+       node_describe_longname_by_id_replacement);
+
+  /* test descriptor upload event */
+  control_event_hs_descriptor_upload(STR_HS_ADDR, STR_HSDESC_ID,
+                                     HSDIR_EXIST_ID, 3600);
+  expected_msg = "650 HS_DESC UPLOAD "STR_HS_ADDR" NONE "\
+                 STR_HSDIR_EXIST_LONGNAME" "STR_HSDESC_ID" SEC_VALID=3600\r\n";
+  test_assert(received_msg);
+  test_streq(received_msg, expected_msg);
+  tor_free(received_msg);
+
+ done:
+  UNMOCK(send_control_event_string);
+  UNMOCK(node_describe_longname_by_id);
+  tor_free(received_msg);
+}
+
 struct testcase_t hs_tests[] = {
-  { "hs_desc_event", test_hs_desc_event, TT_FORK,
+  { "hs_client_desc_event", test_hs_client_desc_event, TT_FORK,
+    NULL, NULL },
+  { "hs_server_desc_event", test_hs_server_desc_event, TT_FORK,
     NULL, NULL },
   END_OF_TESTCASES
 };
