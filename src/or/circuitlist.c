@@ -491,6 +491,9 @@ circuit_purpose_to_controller_string(uint8_t purpose)
     case CIRCUIT_PURPOSE_S_REND_JOINED:
       return "HS_SERVICE_REND";
 
+    case CIRCUIT_PURPOSE_5H_CONNECT_REND:
+      return "HS_5H_REND";
+
     case CIRCUIT_PURPOSE_TESTING:
       return "TESTING";
     case CIRCUIT_PURPOSE_C_MEASURE_TIMEOUT:
