@@ -542,7 +542,8 @@ typedef enum {
 #define CIRCUIT_PURPOSE_PATH_BIAS_TESTING 20
 
 #define CIRCUIT_PURPOSE_5H_CONNECT_REND 21
-#define CIRCUIT_PURPOSE_MAX_ 21
+#define CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE 22
+#define CIRCUIT_PURPOSE_MAX_ 22
 /** A catch-all for unrecognized purposes. Currently we don't expect
  * to make or see any circuits with this purpose. */
 #define CIRCUIT_PURPOSE_UNKNOWN 255

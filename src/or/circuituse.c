@@ -861,7 +861,7 @@ static void
 circuit_predict_and_launch_new(void)
 {
   circuit_t *circ;
-  int num=0, num_internal=0, num_uptime_internal=0;
+  int num=0, num_internal=0, num_uptime_internal=0, num_2hops=0;
   int hidserv_needs_uptime=0, hidserv_needs_capacity=1;
   int port_needs_uptime=0, port_needs_capacity=1;
   time_t now = time(NULL);
@@ -877,6 +877,10 @@ circuit_predict_and_launch_new(void)
       continue; /* don't mess with marked circs */
     if (circ->timestamp_dirty)
       continue; /* only count clean circs */
+	if (circ->purpose == CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE) {
+		num_2hops++;
+		continue;
+	}
     if (circ->purpose != CIRCUIT_PURPOSE_C_GENERAL)
       continue; /* only pay attention to general-purpose circs */
     origin_circ = TO_ORIGIN_CIRCUIT(circ);
@@ -924,11 +928,29 @@ circuit_predict_and_launch_new(void)
     return;
   }
 
+  if (num_2hops < 2) {
+	  log_info(LD_CIRC,
+			  "Have %d clean 2hops circs, need another internal "
+			  "circ for hidden service/client.",
+			  num_2hops);
+	  flags = (CIRCLAUNCH_NEED_CAPACITY | CIRCLAUNCH_NEED_UPTIME |
+			  CIRCLAUNCH_IS_INTERNAL);
+	  circuit_launch(CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE, flags);
+    return;
+  }
+
   /* Fourth, see if we need any more hidden service (client) circuits. */
   if (rep_hist_get_predicted_internal(now, &hidserv_needs_uptime,
                                       &hidserv_needs_capacity) &&
       ((num_uptime_internal<2 && hidserv_needs_uptime) ||
         num_internal<2)) {
+
+  log_info(LD_CIRC, "[!] predicting new HS client circuits %d, %d, %d",
+		 rep_hist_get_predicted_internal(now, &hidserv_needs_uptime,
+                                      &hidserv_needs_capacity),
+		 num_uptime_internal<2 && hidserv_needs_uptime,
+		 num_internal);
+
     if (hidserv_needs_uptime)
       flags |= CIRCLAUNCH_NEED_UPTIME;
     if (hidserv_needs_capacity)
@@ -1515,9 +1537,8 @@ circuit_launch_by_extend_info(uint8_t purpose,
 
   if ((extend_info || purpose != CIRCUIT_PURPOSE_C_GENERAL) &&
       purpose != CIRCUIT_PURPOSE_TESTING && !onehop_tunnel &&
-      /* 5H rend circuit cannot be cannibalized b/c it only needs
-       * 2 hops + exit RP */
-      purpose != CIRCUIT_PURPOSE_5H_CONNECT_REND) {
+	  /* we don't cannibalize rend_base circuit */
+	  purpose != CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE) {
     /* see if there are appropriate circs available to cannibalize. */
     /* XXX if we're planning to add a hop, perhaps we want to look for
      * internal circs rather than exit circs? -RD */
@@ -1526,7 +1547,8 @@ circuit_launch_by_extend_info(uint8_t purpose,
       uint8_t old_purpose = circ->base_.purpose;
       struct timeval old_timestamp_began;
 
-      log_info(LD_CIRC,"Cannibalizing circ '%s' for purpose %d (%s)",
+      log_info(LD_CIRC,"Cannibalizing circ '%s'(%s) for purpose %d (%s)",
+			  circuit_purpose_to_string(TO_CIRCUIT(circ)->purpose),
                build_state_get_exit_nickname(circ->build_state), purpose,
                circuit_purpose_to_string(purpose));
 
@@ -1567,12 +1589,12 @@ circuit_launch_by_extend_info(uint8_t purpose,
       switch (purpose) {
         case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
         case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
-        case CIRCUIT_PURPOSE_5H_CONNECT_REND:
           /* it's ready right now */
           break;
         case CIRCUIT_PURPOSE_C_INTRODUCING:
         case CIRCUIT_PURPOSE_S_CONNECT_REND:
         case CIRCUIT_PURPOSE_C_GENERAL:
+        case CIRCUIT_PURPOSE_5H_CONNECT_REND:
           /* need to add a new hop */
           tor_assert(extend_info);
           if (circuit_extend_to_new_exit(circ, extend_info) < 0)

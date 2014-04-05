@@ -1315,6 +1315,9 @@ new_route_len(uint8_t purpose, extend_info_t *exit, smartlist_t *nodes)
 
   tor_assert(nodes);
 
+  if (purpose == CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE)
+    return 2;
+
   routelen = DEFAULT_ROUTE_LEN;
   if (exit &&
       purpose != CIRCUIT_PURPOSE_5H_CONNECT_REND &&
@@ -1657,6 +1660,7 @@ choose_good_exit_server(uint8_t purpose,
 
   switch (purpose) {
     case CIRCUIT_PURPOSE_C_GENERAL:
+    case CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE:
       if (options->AllowInvalid_ & ALLOW_INVALID_MIDDLE)
         flags |= CRN_ALLOW_INVALID;
       if (is_internal) /* pick it like a middle hop */

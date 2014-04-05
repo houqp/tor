@@ -614,6 +614,8 @@ circuit_purpose_to_string(uint8_t purpose)
       return "Hidden service: Active rendezvous point";
     case CIRCUIT_PURPOSE_5H_CONNECT_REND:
       return "Hidden service: Connection to rendezvous point (5Hop)";
+	case CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE:
+      return "Prebuilt 2 hops REND circuit";
 
     case CIRCUIT_PURPOSE_TESTING:
       return "Testing circuit";
@@ -1295,20 +1297,30 @@ circuit_find_to_cannibalize(uint8_t purpose, extend_info_t *info,
             purpose, need_uptime, need_capacity, internal);
 
   TOR_LIST_FOREACH(circ_, &global_circuitlist, head) {
-    if (CIRCUIT_IS_ORIGIN(circ_) &&
+    if ((CIRCUIT_IS_ORIGIN(circ_) &&
         circ_->state == CIRCUIT_STATE_OPEN &&
         !circ_->marked_for_close &&
         circ_->purpose == CIRCUIT_PURPOSE_C_GENERAL &&
-        !circ_->timestamp_dirty) {
+        !circ_->timestamp_dirty) ||
+		(circ_->purpose == CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE)) {
       origin_circuit_t *circ = TO_ORIGIN_CIRCUIT(circ_);
-      if ((!need_uptime || circ->build_state->need_uptime) &&
+      if (((!need_uptime || circ->build_state->need_uptime) &&
           (!need_capacity || circ->build_state->need_capacity) &&
           (internal == circ->build_state->is_internal) &&
           !circ->unusable_for_new_conns &&
           circ->remaining_relay_early_cells &&
           circ->build_state->desired_path_len == DEFAULT_ROUTE_LEN &&
           !circ->build_state->onehop_tunnel &&
-          !circ->isolation_values_set) {
+          !circ->isolation_values_set) ||
+		  (circ_->purpose == CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE)) {
+		/* rend circuit should only use rend_base */
+		if (purpose == CIRCUIT_PURPOSE_5H_CONNECT_REND &&
+				circ_->purpose != CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE)
+			goto next;
+		/* rend_base should only be used for rend circuits */
+		if (purpose != CIRCUIT_PURPOSE_5H_CONNECT_REND &&
+				circ_->purpose == CIRCUIT_PURPOSE_5H_CONNECT_REND_BASE)
+			goto next;
         if (info) {
           /* need to make sure we don't duplicate hops */
           crypt_path_t *hop = circ->cpath;
